@@ -8,36 +8,19 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
+from twilio.rest import Client
 from twilio.twiml.voice_response import Connect, VoiceResponse
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 PORT = int(os.getenv("PORT", 5050))
-SYSTEM_MESSAGE = """You are a friendly, knowledgeable telemarketing canvasser working for SolarFast. YOU WILL TALK AS FAST AS POSSIBLE AND BE SUCCINT IN YOUR REPLIES AND TRY TO GET TO THE POINT AS QUICKLY A POSSIBTLE Your role is to engage leads professionally, understand their interest in solar energy, gather important qualifying information, and book an appointment for a sales representative to meet with them. Speak conversationally, be clear and concise, and make the lead feel comfortable and valued. Use active listening to respond naturally, guide the conversation, and answer questions clearly. Aim to communicate the potential benefits of solar energy and help leads understand the value of an in-home appointment.
-TALK IN A GLASGWEIGIEN ACCENT, YOU ARE SCOTTISH YOU ARE NOT CRINGE, YOU ARE SCOTTISH.
-
-CONFIRM YOU ARE TALKING TO PAUL BEFORE CONTUINUEING
-
-Hi Paul, this is Jody with SolarFast. I'm reaching out regarding your recent online inquiry about solar options for your property. I'd love to take a few moments to learn more about your interest and see how we can help.
-
-I'd like to ask a few quick questions to tailor the information best for you. Is that alright?
-
-    Interest in Solar: What initially got you interested in solar? Are you looking to make a switch soon, or just exploring your options?
-    Property Details: Can you tell me about your property type (detached, semi-detached, bungalow, terrace)?
-    Ownership & Age: Do you own the property? And, if you don't mind, are you under 75?
-    Roof Details: Does your roof have any obstructions, like skylights, dormers, or chimneys?
-    Energy Bill: About how much is your monthly electric bill?
-    Employment Status: Are you working full-time, part-time, retired, or on any assistance?
-    Residence Duration & Insulation: How long have you lived there, and do you know if there's spray foam insulation on the roof?
-
-The next step is easy! We can arrange for a team member to meet with you to walk through solar options, including savings and potential earnings. In some cases, solar can reduce bills by up to 75%, with an earning potential up to £25,000. Our team will leave you with the full details and a few payment options, including a popular plan that involves a brief credit check. There wouldn't be any credit issues on your end, right?
-
-We're seeing a lot of interest in your area and have a few slots open tomorrow. Would morning, afternoon, or evening work best for you? The assessment typically takes about 60-90 minutes. Also, if you could have an electricity bill handy and let us know if you have a smart meter, that will help us calculate savings accurately.
-
-You're all set for [Date/Time]! You'll receive one last call from our appointment team to confirm the details and let you know who'll be coming by. Please pick up when they call so we can finalize your appointment. Thanks, and we look forward to meeting you!"
-    """
 VOICE = "sage"
 LOG_EVENT_TYPES = [
     "error",
@@ -51,10 +34,16 @@ LOG_EVENT_TYPES = [
 ]
 SHOW_TIMING_MATH = False
 
-app = FastAPI()
 
-if not OPENAI_API_KEY:
-    raise ValueError("Missing the OpenAI API key. Please set it in the .env file.")
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Store active calls and their associated OpenAI WebSocket connections
+active_calls = {}
+
+
+class OutboundCallRequest(BaseModel):
+    phone_number: str
+    callback_url: str = None
 
 
 @app.get("/", response_class=JSONResponse)
@@ -62,11 +51,49 @@ async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
 
 
+@app.post("/make-call")
+async def make_outbound_call(call_request: OutboundCallRequest):
+    """Initiate an outbound call to the specified phone number."""
+    try:
+        # First establish connection with OpenAI
+        openai_ws = await websockets.connect(
+            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+            extra_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1",
+            },
+        )
+
+        # Initialize the OpenAI session
+        await initialize_session(openai_ws)
+
+        # Store the WebSocket connection
+        call = twilio_client.calls.create(
+            to=call_request.phone_number,
+            from_=TWILIO_PHONE_NUMBER,
+            url=(
+                f"https://{call_request.callback_url}/outbound-call-handler"
+                if call_request.callback_url
+                else f"https://{app.state.host}/outbound-call-handler"
+            ),
+            record=True,
+            status_callback=f"https://{app.state.host}/call-status",
+        )
+
+        active_calls[call.sid] = {"openai_ws": openai_ws, "status": "initiating"}
+
+        return {"message": "Call initiated", "call_sid": call.sid}
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500, content={"error": f"Failed to initiate call: {str(e)}"}
+        )
+
+
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
-    # <Say> punctuation to improve text-to-speech flow
     response.say("Please wait while we connect your call, Loading AI Bot")
     response.pause(length=1)
     response.say("start talking!")
@@ -77,27 +104,71 @@ async def handle_incoming_call(request: Request):
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 
+@app.post("/outbound-call-handler")
+async def handle_outbound_call(request: Request):
+    """Handle the outbound call connection and return TwiML."""
+    response = VoiceResponse()
+    response.say("Please wait while we connect you to our AI assistant")
+    response.pause(length=1)
+
+    connect = Connect()
+    connect.stream(url=f"wss://{request.url.hostname}/media-stream")
+    response.append(connect)
+
+    return HTMLResponse(content=str(response), media_type="application/xml")
+
+
+@app.post("/call-status")
+async def call_status_callback(request: Request):
+    """Handle call status callbacks from Twilio."""
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid")
+    call_status = form_data.get("CallStatus")
+
+    if call_sid in active_calls:
+        if call_status in ["completed", "failed", "busy", "no-answer", "canceled"]:
+            # Clean up the OpenAI WebSocket connection
+            try:
+                openai_ws = active_calls[call_sid]["openai_ws"]
+                await openai_ws.close()
+            except:
+                pass
+            del active_calls[call_sid]
+
+    return JSONResponse({"status": "success"})
+
+
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections between Twilio and OpenAI."""
     print("Client connected")
     await websocket.accept()
 
-    async with websockets.connect(
-        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
-        extra_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1",
-        },
-    ) as openai_ws:
-        await initialize_session(openai_ws)
+    stream_sid = None
+    latest_media_timestamp = 0
+    last_assistant_item = None
+    mark_queue = []
+    response_start_timestamp_twilio = None
 
-        # Connection specific state
-        stream_sid = None
-        latest_media_timestamp = 0
-        last_assistant_item = None
-        mark_queue = []
-        response_start_timestamp_twilio = None
+    try:
+        data = await websocket.receive_json()
+        if data["event"] == "start":
+            stream_sid = data["start"]["streamSid"]
+            call_sid = data["start"].get("callSid")
+
+            if call_sid in active_calls:
+                # Use the existing OpenAI WebSocket connection for outbound calls
+                openai_ws = active_calls[call_sid]["openai_ws"]
+            else:
+                # Create new OpenAI WebSocket connection for inbound calls
+                openai_ws = await websockets.connect(
+                    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+                    extra_headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "OpenAI-Beta": "realtime=v1",
+                    },
+                )
+                await initialize_session(openai_ws)
 
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -156,13 +227,11 @@ async def handle_media_stream(websocket: WebSocket):
                                     f"Setting start timestamp for new response: {response_start_timestamp_twilio}ms"
                                 )
 
-                        # Update last_assistant_item safely
                         if response.get("item_id"):
                             last_assistant_item = response["item_id"]
 
                         await send_mark(websocket, stream_sid)
 
-                    # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
                     if response.get("type") == "input_audio_buffer.speech_started":
                         print("Speech started detected.")
                         if last_assistant_item:
@@ -216,24 +285,10 @@ async def handle_media_stream(websocket: WebSocket):
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
-
-async def send_initial_conversation_item(openai_ws):
-    """Send initial conversation item if AI talks first."""
-    initial_conversation_item = {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "user",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'",
-                }
-            ],
-        },
-    }
-    await openai_ws.send(json.dumps(initial_conversation_item))
-    await openai_ws.send(json.dumps({"type": "response.create"}))
+    except WebSocketDisconnect:
+        print("Client disconnected")
+        if openai_ws and openai_ws.open:
+            await openai_ws.close()
 
 
 async def initialize_session(openai_ws):
@@ -245,7 +300,7 @@ async def initialize_session(openai_ws):
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
-            "instructions": SYSTEM_MESSAGE,
+            "instructions": "You are a friendly AI assistant.",  # Replace with your system message
             "modalities": ["text", "audio"],
             "temperature": 0.8,
         },
@@ -253,9 +308,15 @@ async def initialize_session(openai_ws):
     print("Sending session update:", json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
 
-    # Uncomment the next line to have the AI speak first
-    # await send_initial_conversation_item(openai_ws)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    app.state.host = os.getenv("HOST", "your-domain.com")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 if __name__ == "__main__":
     import uvicorn
